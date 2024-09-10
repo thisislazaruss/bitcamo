@@ -1,200 +1,214 @@
-#!/usr/bin/env python3
-
-import argparse
-import os
+import tensorflow as tf
 import numpy as np
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from scipy import spatial
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+def reverse_lookup_l2_distance(embedding_matrix, embedding):
+    """
+    Finds the closest byte to an 8-D embedding using an L2 distance metric.
+    Allows for mapping backwards from embedded space to input space.
 
-import colorama
-from termcolor import colored
+    Parameters
+    ----------
+    embedding_matrix : tensorflow.python.framework.ops.EagerTensor
+        A matrix containing 8-D embeddings for all 256 bytes.
 
-from attacks.config import AttackConfig
-from attacks.fgsm import fgsm_append, fgsm_append_optimal
-from attacks.predetection import bypass_predetection
-from models.malconv import MalConv, KERNEL_SIZE, TARGET_BENIGN, TARGET_MALICIOUS
-from utils.os import code_section_hash, exit, validate_output_directory
-from utils.sample import Sample
-from utils.logs import color_success, format_timedelta, print_error, print_score
-from utils.results import FinalResults
+    embedding : numpy.ndarray
+        A single 8D embedding array to lookup.
 
-# Colorama allows termcolor to work with Windows. More importantly though,
-# when you pipe output to a file in Linux, it won't save the weird control characters.
-colorama.init()
+    Returns
+    -------
+    byte: np.uint8
+        Embedding space representation of the input byte.
+    """
+    distances = [tf.norm(eb - embedding, ord=2) for eb in embedding_matrix]
+    byte_tf = tf.math.argmin(distances)
+    byte_np = np.uint8(np.array(byte_tf, dtype=np.uint8).item())
+    return byte_np
 
-def pre_attack(sample, malconv, attack_config):
-    print(f'Original file hash: {sample.x_hash}')
-    print(f'Original base code section hash: {sample.x_code_hash} ({sample.x_code_section_name})')
+def reverse_lookup_kdtree(reconstruction_tree, embedding):
+    """
+    Finds the nearest byte to an 8-D embedding using a k-d tree.
+    Allows for mapping backwards from embedded space to input space.
 
-    if attack_config.payload_size == 0:
-        attack_config.payload_size = KERNEL_SIZE + (KERNEL_SIZE - np.mod(len(sample.x), KERNEL_SIZE))
+    Parameters
+    ----------
+    reconstruction_tree: scipy.spatial.KDTree
+        A kd-tree containing the 8-d embeddings for all 256 bytes.
 
-    # Record the initial prediction
-    sample.x_embermalconv_score = malconv.predict(sample.x)
-    print_score(sample.x_embermalconv_score, 'Original Executable', attack_config.verbose, '')
+    embedding : numpy.ndarray
+        A single 8D embedding array to lookup.
 
-    sample.results.initialize(sample)
+    Returns
+    -------
+    byte: np.uint8
+        Embedding space representation of the input byte.
+    """
+    return reconstruction_tree.query(embedding)[1].astype(np.uint8)
 
-    return sample
+class Matrix:
+    def __init__(self, malconv):
+        """
+        The embedding matrix class provides some convenience functions for
+        interacting directly with trained embedding layers.
 
-def post_attack(sample, attack_config):
-    result = sample.results.best_result
-    if result.processable == False:
-        print_error('File could not be attacked. It may be too large.')
-        return sample
+        Parameters
+        ----------
+        malconv : models.malconv.MalConv
+            The MalConv model containing the embedding layer.
+        """
+        self.num_bytes = 256
+        self.embedding_size = 8
+        self.malconv = malconv
 
-    print_score(result.x_new_embermalconv_score, 'Modified Executable', attack_config.verbose, '')
-    print(f'Modified file hash: {result.x_new_hash}')
-    print(f'Modified base code section hash: {result.x_new_code_hash} ({sample.x_code_section_name})')
-    print(f'Attack duration: {format_timedelta(sample.results.combined_duration)}')
-    print('Results:')
-    print('   Evades MalConv:', color_success(result.evades_malconv))
-    if attack_config.evade_predetection:
-        print('   Evades pre-detection mechanism:', color_success(result.evades_predetection))
-    print('Perturbed executable path:')
-    print(f'   Location: {sample.output_path}')
+        # Data structures used for forward and reverse lookups through embedding layer
+        self.embedding_matrix = self._setup_embedding_matrix()
+        self.reconstruction_kdtree = self._setup_reconstruction_kdtree(self.embedding_matrix)
 
-    sample.write()
+    def _setup_embedding_matrix(self):
+        """
+        Sets up an embedding matrix that allows for forward and reverse lookups
+        through the embedding layer.
 
-    return sample
+        Returns
+        -------
+        embedding_matrix : tensorflow.python.framework.ops.EagerTensor
+            A matrix containing 8-D embeddings for all 256 bytes.
+        """
+        uniqbytes = np.array([i for i in range(self.num_bytes)], dtype=np.uint8).tobytes()
+        embedding_matrix = self.malconv.embed(uniqbytes)[0][:256]  # Exclude the padding byte
+        return embedding_matrix
 
-def attack(samples, attack_config):
-    malconv = MalConv(attack_mode=True, verbose=attack_config.verbose)
-    count = 0
-    for s in samples:
-        count = count + 1
+    def _setup_reconstruction_kdtree(self, embedding_matrix):
+        """
+        Sets up a kd-tree used for reverse lookups through the embedding layer.
 
-        print(colored(f'[{s.input_path}]', 'blue', 'on_yellow'))
-        print(f'File {count} of {len(samples)}')
-        s.read()
+        Parameters
+        ----------
+        embedding_matrix : tensorflow.python.framework.ops.EagerTensor
+            A matrix containing 8-D embeddings for all 256 bytes.
 
-        print(colored('[Input]', 'magenta', 'on_cyan'))
-        s = pre_attack(s, malconv, attack_config)
+        Returns
+        -------
+        scipy.spatial.KDTree
+            A kd-tree containing the 8-d embeddings for all valid bytes (0-255).
+        """
+        tree = spatial.KDTree(embedding_matrix)
+        return tree
+    
+    def lookup(self, byte):
+        """
+        Performs a forward lookup on a single input byte, returning the
+        corresponding 8D embedding.
 
-        print(colored('[Attack Phase]', 'magenta', 'on_cyan'))
-        if malconv.evasion_achieved(s.x_embermalconv_score, attack_config.y_target) == False:
-            if attack_config.optimize_payload_size:
-                s.results = fgsm_append_optimal(s, malconv, attack_config)
-            else:
-                s.results.best_result = fgsm_append(s, malconv, attack_config, attack_config.payload_size)
-                s.results.attack_count = 1
-                s.results.combined_iterations = s.results.best_result.iterations
-                s.results.combined_duration = s.results.best_result.duration
-                s.results.combined_reconstruction_duration = s.results.best_result.reconstruction_duration
+        Parameters
+        ----------
+        byte : int
+            Byte value to lookup.
+
+        Returns
+        -------
+        numpy.ndarray
+            Embedding space representation of the input byte.
+        """
+        return self.embedding_matrix[byte].numpy()
+    
+    def _reconstruction_l2(self, embeddings, parallel=True):
+        """
+        Performs a backwards mapping through the embedding layer, locating
+        the closest byte to each of the 8-D embeddings that are supplied.
+
+        Parameters
+        ----------
+        embeddings : tensorflow.python.framework.ops.EagerTensor
+            A Tensor with each row being an 8D embedding.
+
+        parallel : bool
+            A boolean signifying that parallel processing should be used.
+
+        Returns
+        -------
+        numpy.ndarray
+            The closest byte to each input row within the input space.
+        """
+        n = len(embeddings)
+
+        if parallel:
+            closest_bytes = Parallel(n_jobs=-1, backend="multiprocessing")(
+                delayed(reverse_lookup_l2_distance)(self.embedding_matrix, embeddings[i]) for i in tqdm(range(n))
+            )
         else:
-            print('   Original sample will already evade MalConv.')
+            closest_bytes = []
+            for i in tqdm(range(n)):
+                closest_bytes.append(
+                    reverse_lookup_l2_distance(self.embedding_matrix, embeddings[i])
+                )
 
-        if attack_config.evade_predetection:
-            print(f'Patching code section:')
-            patched = False
-            if s.results.best_result.x_new is not None:
-                s.results.best_result.x_new, patched = bypass_predetection(s.results.best_result.x_new)
-            print(f'   Attack evades pre-detection: {patched}')
-            s.results.best_result.x_new_code_hash = code_section_hash(s.results.best_result.x_new)[0]
-            s.results.best_result.evades_predetection = s.x_code_hash != s.results.best_result.x_new_code_hash
+        return np.array(closest_bytes, dtype=np.uint8)
 
-        print(colored('[Results]', 'magenta', 'on_cyan'))
-        s = post_attack(s, attack_config)
+    def _reconstruction_kdtree(self, embeddings, parallel=True):
+        """
+        Performs a backwards mapping through the embedding layer, locating
+        the closest byte to each of the 8-D embeddings that are supplied.
 
-        # Before moving on to the next sample, release memory such as the file's raw bytes
-        s.free()
-        print('\n')
+        Parameters
+        ----------
+        embeddings : tensorflow.python.framework.ops.EagerTensor
+            A Tensor with each row being an 8D embedding.
 
-    res = FinalResults(samples, attack_config)
-    res.print()
+        parallel : bool
+            A boolean signifying that parallel processing should be used.
 
-def get_sample(filepath, output_dir, benign, overwrite_output):
-    s = Sample(
-            path=filepath,
-            output_dir=output_dir,
-            benign=benign,
-            overwrite_output=overwrite_output,
-        )
-    if s.valid == False:
-        exit(1)
-    return s
+        Returns
+        -------
+        numpy.ndarray
+            The closest byte to each input row within the input space.
+        """
+        n = len(embeddings)
 
-def get_input_samples(input_filepath, output_dir, benign, overwrite_output):
-    samples = []
+        if parallel:
+            closest_bytes = Parallel(n_jobs=-1, backend="multiprocessing")(
+                delayed(reverse_lookup_kdtree)(self.reconstruction_kdtree, embeddings[i]) for i in tqdm(range(n))
+            )
+        else:
+            closest_bytes = []
+            for i in tqdm(range(n)):
+                closest_bytes.append(
+                    reverse_lookup_kdtree(self.reconstruction_kdtree, embeddings[i])
+                )
 
-    if os.path.exists(input_filepath) == False:
-        print_error(f'Input path does not exist: {input_filepath}')
-        exit(1)
+        return np.array(closest_bytes, dtype=np.uint8)
 
-    if os.path.isfile(input_filepath):
-        s = get_sample(input_filepath, output_dir, benign, overwrite_output)
-        samples.append(s)
+    def reconstruction(self, embeddings, kdtree=True, parallel=True):
+        """
+        Implementation of the reconstruction phase. Maps backwards through
+        the embedding layer, locating the closest byte to each of the
+        supplied 8-d embeddings.
 
-    if os.path.isdir(input_filepath):
-        if os.access(input_filepath, os.R_OK | os.X_OK) == False:
-            print_error(f'Insufficient permission to access input directory: {input_filepath}')
-            exit(1)
+        Parameters
+        ----------
+        embeddings : tensorflow.python.framework.ops.EagerTensor
+            A Tensor with each row being an 8D embedding.
 
-        print(f'Scanning for valid PE files in directory: {input_filepath}')
-        files = os.listdir(input_filepath)
-        for f in files:
-            f = os.path.join(input_filepath, f)
-            if os.path.isfile(f):
-                s = get_sample(f, output_dir, benign, overwrite_output)
-                samples.append(s)
-        num_samples = len(samples)
-        print(f'Found {num_samples} PE files.\n')
+        kdtree : bool
+            A boolean indicating that the KD Tree should be used instead of L2 norms.
 
-    return samples
+        parallel : bool
+            A boolean signifying that parallel processing should be used.
 
-def attack_config_from_program_args(args):
-    cfg = AttackConfig()
+        Returns
+        -------
+        bytes
+            The closest byte to each input row within the input space.
+        """
+        print('Reconstructing payload bytes from perturbed embedding layer:')
 
-    cfg.bengin_inputs = args.benign
-    cfg.payload_size = args.payload_size
-    cfg.initialization_method = args.initalization_method
-    cfg.reconstuct_full_file = args.fullreconstruct
-    cfg.reconstruct_parallel = args.parallel
-    cfg.reconstruct_kdtrees = args.l2norm == False
-    cfg.verbose = args.verbose
-    cfg.evade_predetection = args.predetection
-    cfg.optimize_payload_size = args.optimize_payload
-    cfg.y_target = TARGET_MALICIOUS if args.benign else TARGET_BENIGN
+        if kdtree:
+            print('   Reverse lookup method: kd-tree query')
+            closest_bytes = self._reconstruction_kdtree(embeddings, parallel)
+        else:
+            print('   Reverse lookup method: L2 distance loop using argmin')
+            closest_bytes = self._reconstruction_l2(embeddings, parallel)
 
-    return cfg
-
-def main():
-    print('BitCamo\n')
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-v', '--verbose', help='increase output verbosity', action='store_true')
-    parser.add_argument('-p', '--payload-size', type=int, help='payload size in bytes (optional)', default=900)
-    parser.add_argument('--preserve', help='prevent overwrite of existing output file exists', action='store_true')
-    parser.add_argument('-b', '--benign', help='input file is benign and target class is malicious', action='store_true')
-    parser.add_argument('-o', '--output-dir', type=str, default='samples/output', help='directory to store the modified PE file(s)')
-    parser.add_argument('-i', '--initalization-method', type=str, default='', help='payload initalization method to use. Options are random, psuedorandom, weighted, zeros, and ones.')
-    parser.add_argument('-O', '--optimize-payload', help='attack until the minimal payload size is found', action='store_true')
-    parser.add_argument('--predetection', help='evade the pre-detection mechanism', action='store_true')
-    parser.add_argument('--l2norm', help='use L2 norm for reconstruction phase', action='store_true')
-    parser.add_argument('--parallel', help='enable parallel processing', action='store_true')
-    parser.add_argument('--fullreconstruct', help='perform reconstruction on full file', action='store_true')
-    parser.add_argument('input_filepath', type=str, help='path to a single PE file or directory of PE files')
-
-    args = parser.parse_args()
-    attack_config = attack_config_from_program_args(args)
-
-    if validate_output_directory(args.output_dir) == False:
-        exit(1)
-
-    if args.l2norm == True and args.parallel == False:
-        warning = ("[WARN] The L2 norm reconstruction technique is slow. "
-            "Run bitcamo with --parallel if you need to use this method.")
-        print(colored(warning, 'white', 'on_red'))
-        print('\n')
-
-    samples = get_input_samples(args.input_filepath, args.output_dir, args.benign, args.preserve == False)
-    attack(samples, attack_config)
-
-if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        # Prevents massive stack trace when you press Ctrl+C
-        # Does not always work when parallelism is enabled
-        print('Caught exit signal. Quiting early...')
-        exit(0)
+        return closest_bytes.tobytes()  
